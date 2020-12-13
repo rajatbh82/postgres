@@ -65,7 +65,7 @@
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 
-
+uint64 tuple_count;
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
 ExecutorStart_hook_type ExecutorStart_hook = NULL;
 ExecutorRun_hook_type ExecutorRun_hook = NULL;
@@ -1705,6 +1705,7 @@ ExecutePlan(EState *estate,
 
 	if (use_parallel_mode)
 		ExitParallelMode();
+	tuple_count = current_tuple_count;
 }
 
 

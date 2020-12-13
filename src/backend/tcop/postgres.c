@@ -23,6 +23,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <unistd.h>
+#include "executor/spi.h"
 #include <sys/socket.h>
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
@@ -78,6 +79,10 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "mb/pg_wchar.h"
+#include "utils/rel.h"
+#include <time.h>
+
+extern uint64 tuple_count;
 
 
 /* ----------------
@@ -1064,6 +1069,9 @@ exec_simple_query(const char *query_string)
 	/*
 	 * Run through the raw parsetree(s) and process each one.
 	 */
+	char ins_relname[64];
+	char ins_colname[64];
+	short CREATE_INDEX=0;
 	foreach(parsetree_item, parsetree_list)
 	{
 		RawStmt    *parsetree = lfirst_node(RawStmt, parsetree_item);
@@ -1139,6 +1147,140 @@ exec_simple_query(const char *query_string)
 
 		querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
 												NULL, 0, NULL);
+
+		/* Automatic Index creation code*/
+				CmdType ins_cmdtype;
+				ins_cmdtype=(querytree_list==NULL)? CMD_NOTHING : ((Query*)querytree_list->head->data.ptr_value)->commandType;
+				Oid ins_relid=0;
+				short ins_varattrno=0;
+				short ins_eqopr = 0;
+				short is_catalog_table=0;
+				char tmp_query[1024];
+				//check if the query is either a select or update
+				if(ins_cmdtype==CMD_SELECT || ins_cmdtype==CMD_UPDATE){
+
+
+					//get the relid of queried table from the querytree_list.
+					ins_relid = ((RangeTblEntry*)((Query*)querytree_list->head->data.ptr_value)->rtable->head->data.ptr_value)->relid;
+					printf("========== Relation Id : %u ==========\n",ins_relid);
+					fflush(stdout);
+
+					SPI_connect();
+
+					//create pg_index_statistics table if not exists
+					SPI_exec("Select * from pg_tables where tablename='pg_index_statistics';",0);
+					if(SPI_processed==0){
+						SPI_exec("create table pg_index_statistics( tableid oid, colid oid, access_count int, total_tuple int, threshold int, PRIMARY KEY(tableid,colid) );",0);
+						SPI_finish();
+						SPI_connect();
+					}
+
+					//find out the relation name from relid.
+					Relation ins_rel= RelationIdGetRelation(ins_relid);
+					bzero(ins_relname,64);
+					bzero(ins_colname,64);
+					if(ins_rel==NULL){
+						is_catalog_table = 1;
+					}
+					else{
+						//copy the relation name
+						strncpy(ins_relname,RelationGetRelationName(ins_rel),63);
+						ins_relname[63]='\0';
+						//check for catalog table
+						is_catalog_table = (ins_relname[0]=='p' && ins_relname[1]=='g' && ins_relname[2]=='_')?1:0;
+					}
+
+					Node* quals_node = ((FromExpr *)((Query*)querytree_list->head->data.ptr_value)->jointree)->quals;
+					OpExpr* quals = NULL;
+					//check if this is a simple query with one predicate
+					if(quals_node!=NULL && quals_node->type == T_OpExpr)
+						quals = (OpExpr*) quals_node;
+					//check if there is a where clause
+					if(quals==NULL)
+						ins_eqopr=0;
+					else {
+						Oid oprno = quals->opno;
+						//check for equality operator
+						bzero(tmp_query,1024);
+						sprintf(tmp_query,"SELECT * FROM pg_operator WHERE oprrest='eqsel'::regproc AND oprcom=%u;",oprno);
+						SPI_exec(tmp_query,0);
+						if(SPI_processed==1) ins_eqopr = 1;
+					}
+					//exceute only if it is not a catalog table and has equality predicate.
+					if(ins_eqopr && is_catalog_table==0) {
+						ins_varattrno = (quals->inputcollid==0)?((Var*)quals->args->head->data.ptr_value)->varattno
+													:((Var*)((RelabelType*)quals->args->head->data.ptr_value)->arg)->varattno;
+						printf("========== Attribute Id : %u ==========\n",ins_varattrno);
+						fflush(stdout);
+
+						//get the col_name from the Relation structure.
+						strncpy(ins_colname, (ins_rel->rd_att->attrs[ins_varattrno-1].attname).data,63) ;
+						ins_colname[63]='\0';
+
+						printf("*========== Relation Name : %s and Attribute Name : %s ==========\n",ins_relname,ins_colname);
+						fflush(stdout);
+
+						//check if index already exists on the query attribute
+						bzero(tmp_query,1024);
+						sprintf(tmp_query,"SELECT * FROM pg_index WHERE indrelid='%u' AND indkey='%u';",ins_relid,ins_varattrno);
+						int ret = SPI_exec(tmp_query,0);
+
+						if(ret>0)
+						if(SPI_processed==0){
+							//insert into pg_index_statistics table
+							bzero(tmp_query,1024);
+							sprintf(tmp_query,
+										"INSERT  INTO pg_index_statistics VALUES('%d','%d',0,(select count(*) from %s),4) on conflict (tableid,colid) do update set access_count=pg_index_statistics.access_count+0;"
+										,ins_relid,ins_varattrno,ins_relname);
+							SPI_exec(tmp_query,0);
+							SPI_finish();
+							SPI_connect();
+							fflush(stdout);
+
+							//check for threshold match
+							bzero(tmp_query,1024);
+							sprintf(tmp_query,"SELECT * FROM pg_index_statistics WHERE access_count=threshold AND tableid=%u AND colid='%d'",ins_relid,ins_varattrno);
+							SPI_exec(tmp_query,0);
+
+							printf("========== Threshold Reached ==========\n");
+							fflush(stdout);
+
+							if(SPI_processed==1){
+								//set create index flag
+								CREATE_INDEX =1;
+								printf("========== Deleting Row From pg_index_statistics ==========\n");
+								fflush(stdout);
+								//delete the entry from pg_index_statistics
+								bzero(tmp_query,1024);
+								sprintf(tmp_query,"DELETE FROM pg_index_statistics WHERE tableid=%u AND colid='%d'",ins_relid,ins_varattrno);
+								SPI_exec(tmp_query,0);
+												//create pg_index_analysis table if not exists
+								SPI_exec("Select * from pg_tables where tablename='pg_index_analysis';",0);
+								if(SPI_processed==0){
+									SPI_exec("create table pg_index_analysis( table_name text, attribute_name text, sequential_scan_time decimal, index_creation_time decimal, query_time_using_index decimal, PRIMARY KEY(table_name,attribute_name) );",0);
+								}
+							}
+						}
+					}
+					SPI_finish();
+				}
+				if(CREATE_INDEX ==1) {
+					//free up resources here and exit the normal flow.
+					if (snapshot_set)
+						PopActiveSnapshot();
+
+					if (use_implicit_block)
+						EndImplicitTransactionBlock();
+
+					finish_xact_command();
+
+					//end the command
+					EndCommand(completionTag, dest);
+
+					break;
+				}
+
+				/**********************/
 
 		plantree_list = pg_plan_queries(querytree_list,
 										CURSOR_OPT_PARALLEL_OK, NULL);
@@ -1219,9 +1361,19 @@ exec_simple_query(const char *query_string)
 						 receiver,
 						 receiver,
 						 completionTag);
-
+		int t = tuple_count * 2;
+		SPI_connect();
+		SPI_exec("Select * from pg_tables where tablename='pg_index_statistics';",0);
+		if(SPI_processed!=0){
+		SPI_connect();
+		bzero(tmp_query,1024);
+		sprintf(tmp_query,"UPDATE pg_index_statistics SET access_count = CASE WHEN total_tuple > %d THEN access_count+1 ELSE access_count+0 END WHERE tableid=%u AND colid='%d'",t,ins_relid,ins_varattrno);
+		SPI_exec(tmp_query,0);
+		fflush(stdout);
+		SPI_finish();
+		}
+		SPI_finish();
 		receiver->rDestroy(receiver);
-
 		PortalDrop(portal, false);
 
 		if (lnext(parsetree_item) == NULL)
@@ -1303,6 +1455,53 @@ exec_simple_query(const char *query_string)
 	TRACE_POSTGRESQL_QUERY_DONE(query_string);
 
 	debug_query_string = NULL;
+
+	//check and create index
+	if( CREATE_INDEX==1) {
+				clock_t begin = clock();
+//				exec_simple_query(query_string);
+				clock_t end = clock();
+
+
+				char tmp_query[1024];
+
+				printf("========== Creating Index ==========\n");
+				fflush(stdout);
+				//create index
+				bzero(tmp_query,1024);
+				sprintf(tmp_query,"CREATE INDEX %s_%s on %s(%s)",ins_relname,ins_colname,ins_relname,ins_colname);
+				begin = clock();
+				exec_simple_query(tmp_query);
+
+				end = clock();
+				double time_spent_index_creation = (double)(end - begin) / CLOCKS_PER_SEC;
+				printf("Time in index creation %f\n",time_spent_index_creation);
+
+				begin = clock();
+				//exec this query again with index
+				exec_simple_query(query_string);
+				end = clock();
+				double time_spent_index_scan = (double)(end - begin) / CLOCKS_PER_SEC;
+				printf("Time spent by query after index creation %f\n",time_spent_index_scan);
+
+				begin = clock();
+				//exec this query again with index
+				bzero(tmp_query,1024);
+				sprintf(tmp_query,"select * from %s", ins_relname);
+				exec_simple_query(tmp_query);
+				end = clock();
+				double time_spent_seq_scan = (double)(end - begin) / CLOCKS_PER_SEC;
+				printf("Time spent by query in sequential scan %f\n",time_spent_seq_scan);
+
+				bzero(tmp_query,1024);
+				sprintf(tmp_query,"insert into pg_index_analysis values('%s', '%s', %f, %f, %f);", ins_relname,ins_colname, time_spent_seq_scan, time_spent_index_creation, time_spent_index_scan);
+				exec_simple_query(tmp_query);
+
+
+
+			}
+
+
 }
 
 /*
